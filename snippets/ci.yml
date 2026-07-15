@@ -1,0 +1,184 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend-lint:
+    name: Backend lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install poetry==1.7.1
+
+      - name: Install dependencies
+        run: poetry install --no-root
+
+      - name: Ruff lint
+        run: poetry run ruff check .
+
+      - name: Ruff format check
+        run: poetry run ruff format --check .
+
+  backend-test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: fleet_db_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install poetry==1.7.1
+
+      - name: Install dependencies
+        run: poetry install --no-root
+
+      - name: Generate Fernet key
+        run: |
+          KEY=$(poetry run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+          echo "FIELD_ENCRYPTION_KEY=$KEY" >> $GITHUB_ENV
+
+      - name: Run migrations
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: fleet_db_test
+          POSTGRES_SERVER: localhost
+          POSTGRES_PORT: 5432
+          SECRET_KEY: ci-test-secret-key-do-not-use-in-production
+          HEALTH_SECRET: ci-health-secret-16ch
+          FIELD_ENCRYPTION_KEY: ${{ env.FIELD_ENCRYPTION_KEY }}
+          COOKIE_SECURE: "false"
+        run: poetry run alembic upgrade head
+
+      - name: Run tests
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: fleet_db_test
+          POSTGRES_SERVER: localhost
+          POSTGRES_PORT: 5432
+          SECRET_KEY: ci-test-secret-key-do-not-use-in-production
+          HEALTH_SECRET: ci-health-secret-16ch
+          FIELD_ENCRYPTION_KEY: ${{ env.FIELD_ENCRYPTION_KEY }}
+          COOKIE_SECURE: "false"
+        run: poetry run pytest -v
+
+  frontend-lint:
+    name: Frontend lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: ESLint
+        run: npm run lint
+
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+  security-audit:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Poetry
+        run: pip install poetry==1.7.1
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: poetry install --no-root
+
+      - name: pip-audit
+        working-directory: backend
+        run: |
+          pip install --upgrade pip
+          # CVE-2026-49452 (WeasyPrint): CSS injection via unescaped HTML
+          # attributes, only reachable when presentational_hints=True is
+          # passed to HTML(). This codebase never sets that option, and the
+          # HTML fed to WeasyPrint is generated server-side (not untrusted
+          # input), so the vulnerable code path is unreachable. No fixed
+          # release exists yet upstream — revisit and drop this ignore once
+          # one ships.
+          poetry run pip-audit --ignore-vuln CVE-2026-49452
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: npm audit
+        working-directory: frontend
+        run: npm audit --audit-level=high
